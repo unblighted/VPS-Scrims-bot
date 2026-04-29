@@ -27,22 +27,21 @@ const client = new Client({
 // ─── Rank Config ──────────────────────────────────────────────────────────────
 
 const RANK_ORDER = [
-  "Iron",
-  "Bronze",
-  "Silver",
-  "Gold",
-  "Platinum",
-  "Diamond",
-  "Ascendant",
-  "Immortal",
-  "Radiant",
+  "Iron", "Bronze", "Silver", "Gold", "Platinum",
+  "Diamond", "Ascendant", "Immortal", "Radiant",
 ];
 
-const DEFAULT_RANGE = { min: "Iron", max: "Radiant" };
+const DEFAULT_RANGE = { min: "Ascendant", max: "Radiant" };
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = { guilds: {} };
+
+// pendingInvites: Map<inviteKey, { inviterId, targetId, guildId, expiresAt }>
+// inviteKey = `${inviterId}-${targetId}`
+const pendingInvites = new Map();
+
+const INVITE_TIMEOUT_MS = 60 * 1000; // 1 minute to accept
 
 function getGuildState(guildId) {
   if (!state.guilds[guildId]) {
@@ -80,6 +79,35 @@ function memberMeetsRankRequirement(member, rankRange) {
   return rankIndex >= minIndex && rankIndex <= maxIndex;
 }
 
+// ─── Party Helpers ────────────────────────────────────────────────────────────
+
+// Remove a user from whatever party they're currently in (works outside queue too)
+function removeFromParty(userId, parties, partyOf) {
+  const leader = partyOf.get(userId);
+  if (leader) {
+    const members = parties.get(leader) || [];
+    parties.set(leader, members.filter((m) => m !== userId));
+    partyOf.delete(userId);
+    return;
+  }
+  if (parties.has(userId)) {
+    const members = parties.get(userId) || [];
+    members.forEach((m) => partyOf.delete(m));
+    parties.delete(userId);
+  }
+}
+
+// Global party store so parties persist between queues
+// guildId -> { parties: Map<leaderId, memberId[]>, partyOf: Map<memberId, leaderId> }
+const globalParties = new Map();
+
+function getGuildParties(guildId) {
+  if (!globalParties.has(guildId)) {
+    globalParties.set(guildId, { parties: new Map(), partyOf: new Map() });
+  }
+  return globalParties.get(guildId);
+}
+
 // ─── Slash Commands ───────────────────────────────────────────────────────────
 
 const RANK_CHOICES = RANK_ORDER.map((r) => ({ name: r, value: r }));
@@ -105,30 +133,26 @@ const commands = [
     .setDescription("Set the rank range allowed to join the queue")
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild)
     .addStringOption((opt) =>
-      opt
-        .setName("min")
-        .setDescription("Minimum rank allowed")
-        .setRequired(true)
-        .addChoices(...RANK_CHOICES)
+      opt.setName("min").setDescription("Minimum rank allowed").setRequired(true).addChoices(...RANK_CHOICES)
     )
     .addStringOption((opt) =>
-      opt
-        .setName("max")
-        .setDescription("Maximum rank allowed")
-        .setRequired(true)
-        .addChoices(...RANK_CHOICES)
+      opt.setName("max").setDescription("Maximum rank allowed").setRequired(true).addChoices(...RANK_CHOICES)
     ),
 
   new SlashCommandBuilder()
     .setName("party")
-    .setDescription("Link with a friend to be placed on the same team")
+    .setDescription("Send a party invite to a friend — they must accept via DM")
     .addUserOption((opt) =>
-      opt.setName("teammate").setDescription("The friend to party with").setRequired(true)
+      opt.setName("teammate").setDescription("The friend to invite").setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName("leaveparty")
-    .setDescription("Leave your current party"),
+    .setDescription("Leave or disband your current party"),
+
+  new SlashCommandBuilder()
+    .setName("partystatus")
+    .setDescription("Show who you're currently partied with"),
 
   new SlashCommandBuilder()
     .setName("status")
@@ -172,7 +196,7 @@ async function postQueueAlert(guild, channelId) {
     .setDescription(
       "A new 10-man custom lobby is starting!\n\n" +
       "Press **Join Queue** to enter.\n" +
-      "Use `/party @user` to link with a friend and guarantee same-team placement.\n\n" +
+      "Use `/party @user` to invite a friend — they must accept before you both join.\n\n" +
       `**Rank Range:** ${rangeText}\n\n` +
       "**Players (0/10):**\n*No one yet...*"
     )
@@ -199,8 +223,6 @@ async function postQueueAlert(guild, channelId) {
     channelId,
     players: new Set(),
     playerRanks: new Map(),
-    parties: new Map(),
-    partyOf: new Map(),
     readyPlayers: new Set(),
     phase: "queue",
     teams: null,
@@ -218,6 +240,7 @@ async function updateQueueEmbed(guild, queue) {
   if (!msg) return;
 
   const gs = getGuildState(guild.id);
+  const gp = getGuildParties(guild.id);
   const { min, max } = gs.rankRange;
   const rangeText = min === max ? min : `${min} → ${max}`;
   const playerCount = queue.players.size;
@@ -227,8 +250,8 @@ async function updateQueueEmbed(guild, queue) {
       const member = await guild.members.fetch(uid).catch(() => null);
       const name = member ? member.displayName : "Unknown";
       const rank = queue.playerRanks.get(uid) || "Unranked";
-      const isLeader = queue.parties.has(uid) && queue.parties.get(uid).length > 0;
-      const inParty = queue.partyOf.has(uid);
+      const isLeader = gp.parties.has(uid) && gp.parties.get(uid).length > 0;
+      const inParty = gp.partyOf.has(uid);
       const tag = isLeader || inParty ? " 🤝" : "";
       return `• **${name}**${tag} — ${rank}`;
     })
@@ -240,7 +263,7 @@ async function updateQueueEmbed(guild, queue) {
     .setDescription(
       "A new 10-man custom lobby is starting!\n\n" +
       "Press **Join Queue** to enter.\n" +
-      "Use `/party @user` to link with a friend and guarantee same-team placement.\n\n" +
+      "Use `/party @user` to invite a friend — they must accept before you both join.\n\n" +
       `**Rank Range:** ${rangeText}\n\n` +
       `**Players (${playerCount}/10):**\n` +
       (playerLines.length > 0 ? playerLines.join("\n") : "*No one yet...*")
@@ -265,12 +288,7 @@ async function updateQueueEmbed(guild, queue) {
   await msg.edit({ embeds: [embed], components: [row] }).catch(() => {});
 }
 
-// ─── Rank-Balanced Team Split ─────────────────────────────────────────────────
-//
-// 1. Build party groups, average their rank indices
-// 2. Sort groups highest rank first
-// 3. Snake draft — assign each group to whichever team has the lower rank sum
-// 4. Parties stay together, teams end up as balanced as possible
+// ─── Team Split ───────────────────────────────────────────────────────────────
 
 function splitTeamsByRank(players, playerRanks, parties, partyOf) {
   const assigned = new Set();
@@ -295,10 +313,8 @@ function splitTeamsByRank(players, playerRanks, parties, partyOf) {
 
   groups.sort((a, b) => b.avgRank - a.avgRank);
 
-  const team1 = [];
-  const team2 = [];
-  let team1Sum = 0;
-  let team2Sum = 0;
+  const team1 = [], team2 = [];
+  let team1Sum = 0, team2Sum = 0;
 
   for (const group of groups) {
     if (team1.length < 5 && (team1Sum <= team2Sum || team2.length >= 5)) {
@@ -321,6 +337,7 @@ async function postTeams(guild, queue) {
   const channel = await guild.channels.fetch(queue.channelId).catch(() => null);
   if (!channel) return;
 
+  const gp = getGuildParties(guild.id);
   const { team1, team2 } = queue.teams;
 
   const getLines = async (ids) =>
@@ -491,7 +508,9 @@ client.on("guildCreate", async (guild) => {
 client.on("interactionCreate", async (interaction) => {
   const guildId = interaction.guildId;
   const gs = getGuildState(guildId);
+  const gp = getGuildParties(guildId);
 
+  // ── Slash Commands ──
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
 
@@ -508,22 +527,17 @@ client.on("interactionCreate", async (interaction) => {
       const min = interaction.options.getString("min");
       const max = interaction.options.getString("max");
       if (getRankIndex(min) > getRankIndex(max)) {
-        return interaction.reply({
-          content: "❌ Min rank can't be higher than max rank.",
-          ephemeral: true,
-        });
+        return interaction.reply({ content: "❌ Min rank can't be higher than max rank.", ephemeral: true });
       }
       gs.rankRange = { min, max };
       await interaction.reply({
-        content: `✅ Rank range updated: **${min} → ${max}**\nOnly players with roles in this range can join the next queue.`,
+        content: `✅ Rank range updated: **${min} → ${max}**`,
         ephemeral: true,
       });
     }
 
     else if (commandName === "startqueue") {
-      if (!gs.channelId) {
-        return interaction.reply({ content: "❌ Run `/setup` first.", ephemeral: true });
-      }
+      if (!gs.channelId) return interaction.reply({ content: "❌ Run `/setup` first.", ephemeral: true });
       await postQueueAlert(interaction.guild, gs.channelId);
       await interaction.reply({ content: "✅ Queue alert posted.", ephemeral: true });
     }
@@ -534,18 +548,14 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     else if (commandName === "cancelqueue") {
-      if (!gs.activeQueue) {
-        return interaction.reply({ content: "❌ No active queue.", ephemeral: true });
-      }
+      if (!gs.activeQueue) return interaction.reply({ content: "❌ No active queue.", ephemeral: true });
       await cleanupVoiceChannels(interaction.guild, gs.activeQueue);
       gs.activeQueue = null;
       await interaction.reply({ content: "✅ Queue cancelled.", ephemeral: true });
     }
 
     else if (commandName === "status") {
-      if (!gs.activeQueue) {
-        return interaction.reply({ content: "No active queue right now.", ephemeral: true });
-      }
+      if (!gs.activeQueue) return interaction.reply({ content: "No active queue right now.", ephemeral: true });
       const q = gs.activeQueue;
       await interaction.reply({
         content: `**Phase:** ${q.phase} | **Players:** ${q.players.size}/10 | **Range:** ${gs.rankRange.min} → ${gs.rankRange.max}`,
@@ -553,65 +563,220 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
+    else if (commandName === "partystatus") {
+      const userId = interaction.user.id;
+      const leader = gp.partyOf.get(userId);
+      const members = gp.parties.get(userId) || [];
+
+      if (leader) {
+        const leaderMember = await interaction.guild.members.fetch(leader).catch(() => null);
+        const leaderName = leaderMember ? leaderMember.displayName : "Unknown";
+        await interaction.reply({
+          content: `🤝 You're in a party led by **${leaderName}**.`,
+          ephemeral: true,
+        });
+      } else if (members.length > 0) {
+        const names = await Promise.all(
+          members.map(async (id) => {
+            const m = await interaction.guild.members.fetch(id).catch(() => null);
+            return m ? m.displayName : "Unknown";
+          })
+        );
+        await interaction.reply({
+          content: `🤝 You're leading a party with: **${names.join(", ")}**`,
+          ephemeral: true,
+        });
+      } else {
+        await interaction.reply({ content: "You're not in a party.", ephemeral: true });
+      }
+    }
+
     else if (commandName === "party") {
       const target = interaction.options.getUser("teammate");
-      const userId = interaction.user.id;
+      const inviterId = interaction.user.id;
       const targetId = target.id;
 
-      if (userId === targetId) {
+      if (inviterId === targetId) {
         return interaction.reply({ content: "❌ You can't party with yourself.", ephemeral: true });
       }
 
-      const q = gs.activeQueue;
-      if (!q) {
+      // Check for existing pending invite
+      const inviteKey = `${inviterId}-${targetId}`;
+      if (pendingInvites.has(inviteKey)) {
+        return interaction.reply({ content: "❌ You already have a pending invite to that player.", ephemeral: true });
+      }
+
+      // Try to DM the target
+      const targetUser = await client.users.fetch(targetId).catch(() => null);
+      if (!targetUser) {
+        return interaction.reply({ content: "❌ Couldn't find that user.", ephemeral: true });
+      }
+
+      const inviterMember = await interaction.guild.members.fetch(inviterId).catch(() => null);
+      const inviterName = inviterMember ? inviterMember.displayName : interaction.user.username;
+      const guildName = interaction.guild.name;
+
+      const dmEmbed = new EmbedBuilder()
+        .setColor(0xff4655)
+        .setTitle("🤝  Party Invite")
+        .setDescription(
+          `**${inviterName}** has invited you to party up in **${guildName}**.\n\n` +
+          "You'll be placed on the same team when you both join the queue.\n\n" +
+          "This invite expires in **60 seconds**."
+        )
+        .setTimestamp();
+
+      const dmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`party_accept-${inviteKey}`)
+          .setLabel("Accept")
+          .setStyle(ButtonStyle.Success)
+          .setEmoji("✅"),
+        new ButtonBuilder()
+          .setCustomId(`party_decline-${inviteKey}`)
+          .setLabel("Decline")
+          .setStyle(ButtonStyle.Danger)
+          .setEmoji("❌")
+      );
+
+      let dmSent = false;
+      try {
+        await targetUser.send({ embeds: [dmEmbed], components: [dmRow] });
+        dmSent = true;
+      } catch (e) {
+        // DMs disabled
+      }
+
+      if (!dmSent) {
         return interaction.reply({
-          content: `🤝 Party with <@${targetId}> noted! Join the queue when it opens.`,
+          content: `❌ Couldn't DM <@${targetId}>. They may have DMs disabled.`,
           ephemeral: true,
         });
       }
 
-      const oldLeader = q.partyOf.get(userId);
-      if (oldLeader) {
-        q.parties.set(oldLeader, (q.parties.get(oldLeader) || []).filter((m) => m !== userId));
-        q.partyOf.delete(userId);
-      }
-      if (q.parties.has(userId)) {
-        (q.parties.get(userId) || []).forEach((m) => q.partyOf.delete(m));
-        q.parties.delete(userId);
-      }
+      // Store pending invite
+      pendingInvites.set(inviteKey, {
+        inviterId,
+        targetId,
+        guildId,
+        inviterName,
+        expiresAt: Date.now() + INVITE_TIMEOUT_MS,
+      });
 
-      if (!q.parties.has(userId)) q.parties.set(userId, []);
-      const members = q.parties.get(userId);
-      if (!members.includes(targetId)) members.push(targetId);
-      q.partyOf.set(targetId, userId);
+      // Auto-expire after 60s
+      setTimeout(() => {
+        if (pendingInvites.has(inviteKey)) {
+          pendingInvites.delete(inviteKey);
+        }
+      }, INVITE_TIMEOUT_MS);
 
       await interaction.reply({
-        content: `🤝 Partied with <@${targetId}>! You'll be placed on the same team.`,
+        content: `📨 Party invite sent to <@${targetId}>! They have 60 seconds to accept.`,
         ephemeral: true,
       });
     }
 
     else if (commandName === "leaveparty") {
       const userId = interaction.user.id;
-      const q = gs.activeQueue;
-      if (!q) return interaction.reply({ content: "No active queue.", ephemeral: true });
+      const wasLeader = gp.parties.has(userId) && (gp.parties.get(userId) || []).length > 0;
+      const wasMember = gp.partyOf.has(userId);
 
-      const leader = q.partyOf.get(userId);
-      if (leader) {
-        q.parties.set(leader, (q.parties.get(leader) || []).filter((m) => m !== userId));
-        q.partyOf.delete(userId);
-        await interaction.reply({ content: "✅ Left your party.", ephemeral: true });
-      } else if (q.parties.has(userId)) {
-        (q.parties.get(userId) || []).forEach((m) => q.partyOf.delete(m));
-        q.parties.delete(userId);
+      if (!wasLeader && !wasMember) {
+        return interaction.reply({ content: "You're not in a party.", ephemeral: true });
+      }
+
+      removeFromParty(userId, gp.parties, gp.partyOf);
+
+      // Also remove from active queue party data if in queue
+      const q = gs.activeQueue;
+      if (q) {
+        removeFromParty(userId, q.parties || new Map(), q.partyOf || new Map());
+      }
+
+      if (wasLeader) {
         await interaction.reply({ content: "✅ Party disbanded.", ephemeral: true });
       } else {
-        await interaction.reply({ content: "You're not in a party.", ephemeral: true });
+        await interaction.reply({ content: "✅ Left your party.", ephemeral: true });
       }
     }
   }
 
+  // ── Party Invite Buttons (come from DMs) ──
   if (interaction.isButton()) {
+    // Handle party accept/decline (these fire from DMs, no guildId)
+    if (interaction.customId.startsWith("party_accept-") || interaction.customId.startsWith("party_decline-")) {
+      const isAccept = interaction.customId.startsWith("party_accept-");
+      const inviteKey = interaction.customId.replace("party_accept-", "").replace("party_decline-", "");
+      const invite = pendingInvites.get(inviteKey);
+
+      if (!invite) {
+        return interaction.update({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x888888)
+              .setDescription("❌ This invite has expired or was already responded to."),
+          ],
+          components: [],
+        });
+      }
+
+      pendingInvites.delete(inviteKey);
+
+      if (!isAccept) {
+        // Declined
+        await interaction.update({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xff4655)
+              .setDescription(`❌ You declined the party invite from **${invite.inviterName}**.`),
+          ],
+          components: [],
+        });
+
+        // Notify inviter
+        const inviterUser = await client.users.fetch(invite.inviterId).catch(() => null);
+        if (inviterUser) {
+          await inviterUser
+            .send(`❌ Your party invite was declined.`)
+            .catch(() => {});
+        }
+        return;
+      }
+
+      // Accepted — form the party in global party store
+      const gp = getGuildParties(invite.guildId);
+
+      // Clean up any existing parties for both users
+      removeFromParty(invite.inviterId, gp.parties, gp.partyOf);
+      removeFromParty(invite.targetId, gp.parties, gp.partyOf);
+
+      if (!gp.parties.has(invite.inviterId)) gp.parties.set(invite.inviterId, []);
+      gp.parties.get(invite.inviterId).push(invite.targetId);
+      gp.partyOf.set(invite.targetId, invite.inviterId);
+
+      await interaction.update({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x00ff88)
+            .setDescription(`✅ You accepted the party invite from **${invite.inviterName}**! You'll be placed on the same team.`),
+        ],
+        components: [],
+      });
+
+      // Notify inviter
+      const inviterUser = await client.users.fetch(invite.inviterId).catch(() => null);
+      if (inviterUser) {
+        const targetUser = await client.users.fetch(invite.targetId).catch(() => null);
+        const targetName = targetUser ? targetUser.username : "Your teammate";
+        await inviterUser
+          .send(`✅ **${targetName}** accepted your party invite! You're now partied up.`)
+          .catch(() => {});
+      }
+
+      return;
+    }
+
+    // ── Queue Buttons (fire from guild) ──
     const q = gs.activeQueue;
 
     if (interaction.customId === "join_queue") {
@@ -643,13 +808,22 @@ client.on("interactionCreate", async (interaction) => {
       q.players.add(userId);
       q.playerRanks.set(userId, getMemberRank(member));
 
-      // Pull in party members if they also meet rank req
-      for (const memberId of q.parties.get(userId) || []) {
-        if (q.players.size >= 10 || q.players.has(memberId)) continue;
-        const partyMember = await interaction.guild.members.fetch(memberId).catch(() => null);
-        if (!partyMember || !memberMeetsRankRequirement(partyMember, gs.rankRange)) continue;
-        q.players.add(memberId);
-        q.playerRanks.set(memberId, getMemberRank(partyMember));
+      // Copy global party data into queue state
+      if (!q.parties) q.parties = new Map();
+      if (!q.partyOf) q.partyOf = new Map();
+
+      const partyMembers = gp.parties.get(userId) || [];
+      if (partyMembers.length > 0) {
+        if (!q.parties.has(userId)) q.parties.set(userId, []);
+        for (const memberId of partyMembers) {
+          if (q.players.size >= 10 || q.players.has(memberId)) continue;
+          const partyMember = await interaction.guild.members.fetch(memberId).catch(() => null);
+          if (!partyMember || !memberMeetsRankRequirement(partyMember, gs.rankRange)) continue;
+          q.players.add(memberId);
+          q.playerRanks.set(memberId, getMemberRank(partyMember));
+          q.parties.get(userId).push(memberId);
+          q.partyOf.set(memberId, userId);
+        }
       }
 
       await interaction.deferUpdate();
@@ -657,7 +831,7 @@ client.on("interactionCreate", async (interaction) => {
 
       if (q.players.size >= 10) {
         q.phase = "teams";
-        q.teams = splitTeamsByRank(q.players, q.playerRanks, q.parties, q.partyOf);
+        q.teams = splitTeamsByRank(q.players, q.playerRanks, q.parties || new Map(), q.partyOf || new Map());
         await postTeams(interaction.guild, q);
       }
     }
@@ -672,7 +846,7 @@ client.on("interactionCreate", async (interaction) => {
 
       q.players.delete(interaction.user.id);
       q.playerRanks.delete(interaction.user.id);
-      for (const m of q.parties.get(interaction.user.id) || []) {
+      for (const m of (q.parties?.get(interaction.user.id) || [])) {
         q.players.delete(m);
         q.playerRanks.delete(m);
       }
