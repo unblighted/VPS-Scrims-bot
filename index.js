@@ -31,17 +31,14 @@ const RANK_ORDER = [
   "Diamond", "Ascendant", "Immortal", "Radiant",
 ];
 
-const DEFAULT_RANGE = { min: "Ascendant", max: "Radiant" };
+const DEFAULT_RANGE = { min: "Iron", max: "Radiant" };
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = { guilds: {} };
 
-// pendingInvites: Map<inviteKey, { inviterId, targetId, guildId, expiresAt }>
-// inviteKey = `${inviterId}-${targetId}`
 const pendingInvites = new Map();
-
-const INVITE_TIMEOUT_MS = 60 * 1000; // 1 minute to accept
+const INVITE_TIMEOUT_MS = 60 * 1000;
 
 function getGuildState(guildId) {
   if (!state.guilds[guildId]) {
@@ -81,7 +78,6 @@ function memberMeetsRankRequirement(member, rankRange) {
 
 // ─── Party Helpers ────────────────────────────────────────────────────────────
 
-// Remove a user from whatever party they're currently in (works outside queue too)
 function removeFromParty(userId, parties, partyOf) {
   const leader = partyOf.get(userId);
   if (leader) {
@@ -97,8 +93,6 @@ function removeFromParty(userId, parties, partyOf) {
   }
 }
 
-// Global party store so parties persist between queues
-// guildId -> { parties: Map<leaderId, memberId[]>, partyOf: Map<memberId, leaderId> }
 const globalParties = new Map();
 
 function getGuildParties(guildId) {
@@ -141,7 +135,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("party")
-    .setDescription("Send a party invite to a friend — they must accept via DM")
+    .setDescription("Send a party invite to a friend via DM")
     .addUserOption((opt) =>
       opt.setName("teammate").setDescription("The friend to invite").setRequired(true)
     ),
@@ -162,6 +156,16 @@ const commands = [
     .setName("cancelqueue")
     .setDescription("Cancel the active queue")
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("lobby")
+    .setDescription("Claim lobby leader or share the lobby code")
+    .addStringOption((opt) =>
+      opt
+        .setName("code")
+        .setDescription("The custom lobby code to share with your team (optional)")
+        .setRequired(false)
+    ),
 ].map((cmd) => cmd.toJSON());
 
 // ─── Register Commands ────────────────────────────────────────────────────────
@@ -185,7 +189,7 @@ async function postQueueAlert(guild, channelId) {
   if (!channel) return;
 
   const gs = getGuildState(guild.id);
-  if (gs.activeQueue) await cleanupVoiceChannels(guild, gs.activeQueue);
+  if (gs.activeQueue) await cleanupLobby(guild, gs.activeQueue);
 
   const { min, max } = gs.rankRange;
   const rangeText = min === max ? min : `${min} → ${max}`;
@@ -223,11 +227,15 @@ async function postQueueAlert(guild, channelId) {
     channelId,
     players: new Set(),
     playerRanks: new Map(),
+    parties: new Map(),
+    partyOf: new Map(),
     readyPlayers: new Set(),
     phase: "queue",
     teams: null,
     voiceChannels: { team1Id: null, team2Id: null },
+    lobbyChannelId: null,
     categoryId: null,
+    lobbyLeaderId: null,
   };
 
   console.log(`[Queue] Posted alert in ${guild.name}`);
@@ -337,7 +345,6 @@ async function postTeams(guild, queue) {
   const channel = await guild.channels.fetch(queue.channelId).catch(() => null);
   if (!channel) return;
 
-  const gp = getGuildParties(guild.id);
   const { team1, team2 } = queue.teams;
 
   const getLines = async (ids) =>
@@ -359,12 +366,28 @@ async function postTeams(guild, queue) {
 
   const [t1Lines, t2Lines] = await Promise.all([getLines(team1), getLines(team2)]);
 
+  // Build the allowed users list for the private lobby channel
+  const allPlayers = [...team1, ...team2];
+  const allowedPermissions = allPlayers.map((id) => ({
+    id,
+    allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
+  }));
+
+  // Create category
   const category = await guild.channels.create({
     name: "🔴 VPS Scrims",
     type: ChannelType.GuildCategory,
+    permissionOverwrites: [
+      {
+        id: guild.roles.everyone,
+        deny: [PermissionsBitField.Flags.ViewChannel],
+      },
+      ...allowedPermissions,
+    ],
   });
   queue.categoryId = category.id;
 
+  // Create voice channels
   const vc1 = await guild.channels.create({
     name: "🔴 Team 1",
     type: ChannelType.GuildVoice,
@@ -379,10 +402,19 @@ async function postTeams(guild, queue) {
     userLimit: 5,
   });
 
+  // Create private lobby text channel
+  const lobbyChannel = await guild.channels.create({
+    name: "📋┃lobby-info",
+    type: ChannelType.GuildText,
+    parent: category.id,
+  });
+
   queue.voiceChannels.team1Id = vc1.id;
   queue.voiceChannels.team2Id = vc2.id;
+  queue.lobbyChannelId = lobbyChannel.id;
 
-  const embed = new EmbedBuilder()
+  // Post teams embed in main queue channel
+  const teamsEmbed = new EmbedBuilder()
     .setColor(0xff4655)
     .setTitle("⚔️  TEAMS ARE SET")
     .addFields(
@@ -400,22 +432,39 @@ async function postTeams(guild, queue) {
         name: "\u200B",
         value:
           `Voice channels: ${vc1} and ${vc2}\n\n` +
-          "**Host:** Set up the custom lobby in Valorant and share the **lobby code + password** here.\n" +
-          "Once you're in the lobby, type **`ready`** in this channel.\n\n" +
-          "*Game starts when all 10 players are ready.*",
+          `Head to ${lobbyChannel} for lobby info.\n\n` +
+          "Someone run `/lobby` to claim host, then `/lobby [code]` to share the code.\n" +
+          "Type **`ready`** in this channel once you're in the lobby.",
         inline: false,
       }
     )
-    .setFooter({ text: "Teams balanced by rank • Type 'ready' when you're in the lobby" })
+    .setFooter({ text: "Teams balanced by rank • Type 'ready' in this channel when you're in the lobby" })
     .setTimestamp();
 
-  await channel.send({ embeds: [embed] });
+  await channel.send({ embeds: [teamsEmbed] });
+
+  // Post welcome message in private lobby channel
+  const playerMentions = allPlayers.map((id) => `<@${id}>`).join(" ");
+  const lobbyWelcomeEmbed = new EmbedBuilder()
+    .setColor(0xff4655)
+    .setTitle("📋  Lobby Info")
+    .setDescription(
+      `${playerMentions}\n\n` +
+      "This is your private lobby channel.\n\n" +
+      "**To claim host:** run `/lobby` in this channel\n" +
+      "**To share the code:** run `/lobby [code]` in this channel\n\n" +
+      "*Only players in this 10-man can see this channel.*"
+    )
+    .setTimestamp();
+
+  await lobbyChannel.send({ embeds: [lobbyWelcomeEmbed] });
+
   queue.phase = "ready";
 }
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
 
-async function cleanupVoiceChannels(guild, queue) {
+async function cleanupLobby(guild, queue) {
   if (!queue) return;
   try {
     if (queue.voiceChannels.team1Id) {
@@ -425,6 +474,10 @@ async function cleanupVoiceChannels(guild, queue) {
     if (queue.voiceChannels.team2Id) {
       const vc = await guild.channels.fetch(queue.voiceChannels.team2Id).catch(() => null);
       if (vc) await vc.delete().catch(() => {});
+    }
+    if (queue.lobbyChannelId) {
+      const lc = await guild.channels.fetch(queue.lobbyChannelId).catch(() => null);
+      if (lc) await lc.delete().catch(() => {});
     }
     if (queue.categoryId) {
       const cat = await guild.channels.fetch(queue.categoryId).catch(() => null);
@@ -449,23 +502,30 @@ async function handleReadyCheck(message, queue) {
 
   if (readyCount >= total) {
     const channel = await client.channels.fetch(queue.channelId).catch(() => null);
-    if (!channel) return;
+    if (channel) {
+      const embed = new EmbedBuilder()
+        .setColor(0x00ff88)
+        .setTitle("✅  ALL PLAYERS READY — GLHF!")
+        .setDescription(
+          "Everyone is in the lobby. **Start the game!**\n\n" +
+          "This lobby channel will be removed in 5 minutes.\n" +
+          "*Good luck, have fun.* 🎯"
+        )
+        .setTimestamp();
+      await channel.send({ embeds: [embed] });
+    }
 
-    const embed = new EmbedBuilder()
-      .setColor(0x00ff88)
-      .setTitle("✅  ALL PLAYERS READY — GLHF!")
-      .setDescription(
-        "Everyone is in the lobby. **Start the game!**\n\n" +
-        "Voice channels will be removed in 5 minutes.\n" +
-        "*Good luck, have fun.* 🎯"
-      )
-      .setTimestamp();
-
-    await channel.send({ embeds: [embed] });
+    // Also post in lobby channel
+    if (queue.lobbyChannelId) {
+      const lobbyChannel = await client.channels.fetch(queue.lobbyChannelId).catch(() => null);
+      if (lobbyChannel) {
+        await lobbyChannel.send("✅ **All players ready — start the game! GLHF** 🎯").catch(() => {});
+      }
+    }
 
     setTimeout(async () => {
       const guild = client.guilds.cache.get(message.guild.id);
-      if (guild) await cleanupVoiceChannels(guild, queue);
+      if (guild) await cleanupLobby(guild, queue);
       const gs = getGuildState(message.guild.id);
       if (gs) gs.activeQueue = null;
     }, 5 * 60 * 1000);
@@ -549,7 +609,7 @@ client.on("interactionCreate", async (interaction) => {
 
     else if (commandName === "cancelqueue") {
       if (!gs.activeQueue) return interaction.reply({ content: "❌ No active queue.", ephemeral: true });
-      await cleanupVoiceChannels(interaction.guild, gs.activeQueue);
+      await cleanupLobby(interaction.guild, gs.activeQueue);
       gs.activeQueue = null;
       await interaction.reply({ content: "✅ Queue cancelled.", ephemeral: true });
     }
@@ -563,6 +623,97 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
+    else if (commandName === "lobby") {
+      const q = gs.activeQueue;
+
+      // Must be used in the private lobby channel
+      if (!q || !q.lobbyChannelId) {
+        return interaction.reply({
+          content: "❌ No active lobby. This command is only available after teams are set.",
+          ephemeral: true,
+        });
+      }
+
+      if (interaction.channelId !== q.lobbyChannelId) {
+        const lobbyChannel = await interaction.guild.channels.fetch(q.lobbyChannelId).catch(() => null);
+        return interaction.reply({
+          content: `❌ Use this command in ${lobbyChannel || "the lobby-info channel"}.`,
+          ephemeral: true,
+        });
+      }
+
+      const allPlayers = [...(q.teams?.team1 || []), ...(q.teams?.team2 || [])];
+      if (!allPlayers.includes(interaction.user.id)) {
+        return interaction.reply({
+          content: "❌ You're not in this lobby.",
+          ephemeral: true,
+        });
+      }
+
+      const code = interaction.options.getString("code");
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const displayName = member ? member.displayName : interaction.user.username;
+
+      if (!code) {
+        // Claim lobby leader
+        if (q.lobbyLeaderId) {
+          const currentLeader = await interaction.guild.members.fetch(q.lobbyLeaderId).catch(() => null);
+          const leaderName = currentLeader ? currentLeader.displayName : "Someone";
+          return interaction.reply({
+            content: `❌ **${leaderName}** is already the lobby leader. Only one host per lobby.`,
+            ephemeral: true,
+          });
+        }
+
+        q.lobbyLeaderId = interaction.user.id;
+
+        const embed = new EmbedBuilder()
+          .setColor(0xff4655)
+          .setTitle("👑  Lobby Leader Assigned")
+          .setDescription(
+            `**${displayName}** is the lobby leader for this 10-man.\n\n` +
+            "Set up the custom game in Valorant:\n" +
+            "**Game Mode:** Standard • **Map:** Your choice\n\n" +
+            "Once you have the lobby code run `/lobby [code]` to share it here."
+          )
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed] });
+      } else {
+        // Share lobby code
+        if (!q.lobbyLeaderId) {
+          return interaction.reply({
+            content: "❌ No lobby leader has been assigned yet. Run `/lobby` first to claim host.",
+            ephemeral: true,
+          });
+        }
+
+        if (q.lobbyLeaderId !== interaction.user.id) {
+          const leader = await interaction.guild.members.fetch(q.lobbyLeaderId).catch(() => null);
+          const leaderName = leader ? leader.displayName : "the lobby leader";
+          return interaction.reply({
+            content: `❌ Only **${leaderName}** can share the lobby code.`,
+            ephemeral: true,
+          });
+        }
+
+        const playerMentions = allPlayers.map((id) => `<@${id}>`).join(" ");
+
+        const embed = new EmbedBuilder()
+          .setColor(0x00ff88)
+          .setTitle("🎮  Lobby Code")
+          .addFields(
+            { name: "Code", value: `\`\`\`${code}\`\`\``, inline: false },
+            { name: "Host", value: `<@${interaction.user.id}>`, inline: true },
+          )
+          .setDescription(`${playerMentions}\n\nJoin the lobby and type **\`ready\`** in <#${q.channelId}> when you're in.`)
+          .setFooter({ text: "VPS Scrims • Custom Lobby" })
+          .setTimestamp();
+
+        await interaction.reply({ embeds: [embed] });
+      }
+    }
+
     else if (commandName === "partystatus") {
       const userId = interaction.user.id;
       const leader = gp.partyOf.get(userId);
@@ -571,10 +722,7 @@ client.on("interactionCreate", async (interaction) => {
       if (leader) {
         const leaderMember = await interaction.guild.members.fetch(leader).catch(() => null);
         const leaderName = leaderMember ? leaderMember.displayName : "Unknown";
-        await interaction.reply({
-          content: `🤝 You're in a party led by **${leaderName}**.`,
-          ephemeral: true,
-        });
+        await interaction.reply({ content: `🤝 You're in a party led by **${leaderName}**.`, ephemeral: true });
       } else if (members.length > 0) {
         const names = await Promise.all(
           members.map(async (id) => {
@@ -582,10 +730,7 @@ client.on("interactionCreate", async (interaction) => {
             return m ? m.displayName : "Unknown";
           })
         );
-        await interaction.reply({
-          content: `🤝 You're leading a party with: **${names.join(", ")}**`,
-          ephemeral: true,
-        });
+        await interaction.reply({ content: `🤝 You're leading a party with: **${names.join(", ")}**`, ephemeral: true });
       } else {
         await interaction.reply({ content: "You're not in a party.", ephemeral: true });
       }
@@ -600,13 +745,11 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "❌ You can't party with yourself.", ephemeral: true });
       }
 
-      // Check for existing pending invite
       const inviteKey = `${inviterId}-${targetId}`;
       if (pendingInvites.has(inviteKey)) {
         return interaction.reply({ content: "❌ You already have a pending invite to that player.", ephemeral: true });
       }
 
-      // Try to DM the target
       const targetUser = await client.users.fetch(targetId).catch(() => null);
       if (!targetUser) {
         return interaction.reply({ content: "❌ Couldn't find that user.", ephemeral: true });
@@ -643,9 +786,7 @@ client.on("interactionCreate", async (interaction) => {
       try {
         await targetUser.send({ embeds: [dmEmbed], components: [dmRow] });
         dmSent = true;
-      } catch (e) {
-        // DMs disabled
-      }
+      } catch (e) {}
 
       if (!dmSent) {
         return interaction.reply({
@@ -654,21 +795,12 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // Store pending invite
       pendingInvites.set(inviteKey, {
-        inviterId,
-        targetId,
-        guildId,
-        inviterName,
+        inviterId, targetId, guildId, inviterName,
         expiresAt: Date.now() + INVITE_TIMEOUT_MS,
       });
 
-      // Auto-expire after 60s
-      setTimeout(() => {
-        if (pendingInvites.has(inviteKey)) {
-          pendingInvites.delete(inviteKey);
-        }
-      }, INVITE_TIMEOUT_MS);
+      setTimeout(() => pendingInvites.delete(inviteKey), INVITE_TIMEOUT_MS);
 
       await interaction.reply({
         content: `📨 Party invite sent to <@${targetId}>! They have 60 seconds to accept.`,
@@ -687,23 +819,20 @@ client.on("interactionCreate", async (interaction) => {
 
       removeFromParty(userId, gp.parties, gp.partyOf);
 
-      // Also remove from active queue party data if in queue
       const q = gs.activeQueue;
-      if (q) {
-        removeFromParty(userId, q.parties || new Map(), q.partyOf || new Map());
-      }
+      if (q) removeFromParty(userId, q.parties || new Map(), q.partyOf || new Map());
 
-      if (wasLeader) {
-        await interaction.reply({ content: "✅ Party disbanded.", ephemeral: true });
-      } else {
-        await interaction.reply({ content: "✅ Left your party.", ephemeral: true });
-      }
+      await interaction.reply({
+        content: wasLeader ? "✅ Party disbanded." : "✅ Left your party.",
+        ephemeral: true,
+      });
     }
   }
 
-  // ── Party Invite Buttons (come from DMs) ──
+  // ── Buttons ──
   if (interaction.isButton()) {
-    // Handle party accept/decline (these fire from DMs, no guildId)
+
+    // Party accept/decline (from DMs)
     if (interaction.customId.startsWith("party_accept-") || interaction.customId.startsWith("party_decline-")) {
       const isAccept = interaction.customId.startsWith("party_accept-");
       const inviteKey = interaction.customId.replace("party_accept-", "").replace("party_decline-", "");
@@ -711,11 +840,7 @@ client.on("interactionCreate", async (interaction) => {
 
       if (!invite) {
         return interaction.update({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0x888888)
-              .setDescription("❌ This invite has expired or was already responded to."),
-          ],
+          embeds: [new EmbedBuilder().setColor(0x888888).setDescription("❌ This invite has expired or was already responded to.")],
           components: [],
         });
       }
@@ -723,30 +848,16 @@ client.on("interactionCreate", async (interaction) => {
       pendingInvites.delete(inviteKey);
 
       if (!isAccept) {
-        // Declined
         await interaction.update({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0xff4655)
-              .setDescription(`❌ You declined the party invite from **${invite.inviterName}**.`),
-          ],
+          embeds: [new EmbedBuilder().setColor(0xff4655).setDescription(`❌ You declined the party invite from **${invite.inviterName}**.`)],
           components: [],
         });
-
-        // Notify inviter
         const inviterUser = await client.users.fetch(invite.inviterId).catch(() => null);
-        if (inviterUser) {
-          await inviterUser
-            .send(`❌ Your party invite was declined.`)
-            .catch(() => {});
-        }
+        if (inviterUser) await inviterUser.send("❌ Your party invite was declined.").catch(() => {});
         return;
       }
 
-      // Accepted — form the party in global party store
       const gp = getGuildParties(invite.guildId);
-
-      // Clean up any existing parties for both users
       removeFromParty(invite.inviterId, gp.parties, gp.partyOf);
       removeFromParty(invite.targetId, gp.parties, gp.partyOf);
 
@@ -755,28 +866,20 @@ client.on("interactionCreate", async (interaction) => {
       gp.partyOf.set(invite.targetId, invite.inviterId);
 
       await interaction.update({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0x00ff88)
-            .setDescription(`✅ You accepted the party invite from **${invite.inviterName}**! You'll be placed on the same team.`),
-        ],
+        embeds: [new EmbedBuilder().setColor(0x00ff88).setDescription(`✅ You accepted the party invite from **${invite.inviterName}**! You'll be placed on the same team.`)],
         components: [],
       });
 
-      // Notify inviter
       const inviterUser = await client.users.fetch(invite.inviterId).catch(() => null);
       if (inviterUser) {
         const targetUser = await client.users.fetch(invite.targetId).catch(() => null);
         const targetName = targetUser ? targetUser.username : "Your teammate";
-        await inviterUser
-          .send(`✅ **${targetName}** accepted your party invite! You're now partied up.`)
-          .catch(() => {});
+        await inviterUser.send(`✅ **${targetName}** accepted your party invite! You're now partied up.`).catch(() => {});
       }
-
       return;
     }
 
-    // ── Queue Buttons (fire from guild) ──
+    // Queue buttons (from guild)
     const q = gs.activeQueue;
 
     if (interaction.customId === "join_queue") {
@@ -808,7 +911,6 @@ client.on("interactionCreate", async (interaction) => {
       q.players.add(userId);
       q.playerRanks.set(userId, getMemberRank(member));
 
-      // Copy global party data into queue state
       if (!q.parties) q.parties = new Map();
       if (!q.partyOf) q.partyOf = new Map();
 
