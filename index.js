@@ -8,6 +8,8 @@ const {
   PermissionsBitField,
   ChannelType,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   REST,
   Routes,
 } = require("discord.js");
@@ -160,6 +162,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName("cancelqueue")
     .setDescription("Cancel the active queue")
+    .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("setuproles")
+    .setDescription("Post the rank selection embed in this channel")
     .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
 
   new SlashCommandBuilder()
@@ -608,9 +615,25 @@ client.on("interactionCreate", async (interaction) => {
 
     if (commandName === "setup") {
       gs.channelId = interaction.channelId;
+
+      // Lock channel — members can view and use buttons but not type/react/thread
+      await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, {
+        SendMessages: false,
+        AddReactions: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+        SendMessagesInThreads: false,
+      }).catch(() => {});
+
+      // Ensure the bot can still post
+      await interaction.channel.permissionOverwrites.edit(interaction.guild.members.me, {
+        SendMessages: true,
+        AddReactions: true,
+      }).catch(() => {});
+
       startAutoQueue(interaction.guild, interaction.channelId);
       await interaction.reply({
-        content: `✅ Queue channel set to ${interaction.channel}. Auto-queue every 40 minutes is now active.\nCurrent rank range: **${gs.rankRange.min} → ${gs.rankRange.max}**`,
+        content: `✅ Queue channel set to ${interaction.channel}. Auto-queue every 40 minutes is now active.\nChannel locked — members can view and click buttons but cannot type.\nCurrent rank range: **${gs.rankRange.min} → ${gs.rankRange.max}**`,
         ephemeral: true,
       });
     }
@@ -653,6 +676,57 @@ client.on("interactionCreate", async (interaction) => {
         content: `**Phase:** ${q.phase} | **Players:** ${q.players.size}/10 | **Range:** ${gs.rankRange.min} → ${gs.rankRange.max}`,
         ephemeral: true,
       });
+    }
+
+    else if (commandName === "setuproles") {
+      const rankEmojis = {
+        Iron: "⚫", Bronze: "🟤", Silver: "⚪", Gold: "🟡",
+        Platinum: "🩵", Diamond: "💎", Ascendant: "🟢", Immortal: "🔴", Radiant: "✨",
+      };
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff4655)
+        .setTitle("🏅  Select Your Rank")
+        .setDescription(
+          "Pick your **current Valorant rank** from the dropdown below.\n" +
+          "This will assign you the matching role on this server.\n\n" +
+          "Selecting a new rank will automatically remove your old one.\n\n" +
+          "> ⚠️ **Please select your honest rank.** Misrepresenting your rank to enter a queue you don't belong in may result in a ban from this server."
+        )
+        .setFooter({ text: "VPS Scrims • One rank per player" })
+        .setTimestamp();
+
+      const options = RANK_ORDER.map((rank) =>
+        new StringSelectMenuOptionBuilder()
+          .setLabel(rank)
+          .setValue(rank)
+          .setEmoji(rankEmojis[rank])
+      );
+
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId("select_rank")
+        .setPlaceholder("Choose your rank...")
+        .addOptions(options);
+
+      const row = new ActionRowBuilder().addComponents(menu);
+
+      // Lock channel — members can view and use dropdown but not type/react/thread
+      await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, {
+        SendMessages: false,
+        AddReactions: false,
+        CreatePublicThreads: false,
+        CreatePrivateThreads: false,
+        SendMessagesInThreads: false,
+      }).catch(() => {});
+
+      // Ensure the bot can still post
+      await interaction.channel.permissionOverwrites.edit(interaction.guild.members.me, {
+        SendMessages: true,
+        AddReactions: true,
+      }).catch(() => {});
+
+      await interaction.channel.send({ embeds: [embed], components: [row] });
+      await interaction.reply({ content: "✅ Rank selection embed posted and channel locked.", ephemeral: true });
     }
 
     else if (commandName === "lobby") {
@@ -1010,6 +1084,57 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferUpdate();
       await updateQueueEmbed(interaction.guild, q);
     }
+  }
+});
+
+// ─── Select Menu (rank assignment) ──────────────────────────────────────────
+
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isStringSelectMenu()) return;
+
+  if (interaction.customId === "select_rank") {
+    const selectedRank = interaction.values[0];
+    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+    if (!member) {
+      return interaction.reply({ content: "❌ Couldn't fetch your member data.", ephemeral: true });
+    }
+
+    // Remove all existing rank roles
+    const rankRolesToRemove = member.roles.cache.filter((r) => RANK_ORDER.includes(r.name));
+    if (rankRolesToRemove.size > 0) {
+      await member.roles.remove(rankRolesToRemove).catch(() => {});
+    }
+
+    // Find or create the role
+    let role = interaction.guild.roles.cache.find((r) => r.name === selectedRank);
+    if (!role) {
+      const rankColors = {
+        Iron: 0x8b8b8b, Bronze: 0xa0522d, Silver: 0xc0c0c0, Gold: 0xffd700,
+        Platinum: 0x00b4d8, Diamond: 0x00b4ff, Ascendant: 0x00ff88,
+        Immortal: 0xff4655, Radiant: 0xfffacd,
+      };
+      role = await interaction.guild.roles.create({
+        name: selectedRank,
+        color: rankColors[selectedRank] || 0x99aab5,
+        reason: "VPS Scrims rank role auto-created",
+      }).catch(() => null);
+    }
+
+    if (!role) {
+      return interaction.reply({ content: "❌ Failed to assign role. Please contact an admin.", ephemeral: true });
+    }
+
+    await member.roles.add(role).catch(() => {});
+
+    const rankEmojis = {
+      Iron: "⚫", Bronze: "🟤", Silver: "⚪", Gold: "🟡",
+      Platinum: "🩵", Diamond: "💎", Ascendant: "🟢", Immortal: "🔴", Radiant: "✨",
+    };
+
+    await interaction.reply({
+      content: `✅ You've been assigned the **${rankEmojis[selectedRank]} ${selectedRank}** role.`,
+      ephemeral: true,
+    });
   }
 });
 
