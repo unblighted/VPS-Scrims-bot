@@ -35,7 +35,7 @@ const RANK_ORDER = ["Iron","Bronze","Silver","Gold","Platinum","Diamond","Ascend
 const RANK_EMOJIS = { Iron:"⚫",Bronze:"🟤",Silver:"⚪",Gold:"🟡",Platinum:"🩵",Diamond:"💎",Ascendant:"🟢",Immortal:"🔴",Radiant:"✨" };
 const RANK_COLORS = { Iron:0x8b8b8b,Bronze:0xa0522d,Silver:0xc0c0c0,Gold:0xffd700,Platinum:0x00b4d8,Diamond:0x00b4ff,Ascendant:0x00ff88,Immortal:0xff4655,Radiant:0xfffacd };
 const DEFAULT_RANGE = { min:"Iron", max:"Radiant" };
-const QUEUE_SIZE = 10;
+const QUEUE_SIZE = 2;
 const TEAM_SIZE = Math.floor(QUEUE_SIZE / 2);
 const INVITE_TIMEOUT_MS = 60 * 1000;
 const LOBBY_CODE_REGEX = /^[A-Za-z0-9]{6}$/;
@@ -188,6 +188,9 @@ const commands = [
     .setName("stats").setDescription("Show W/L/KDA stats for a player")
     .addUserOption(o=>o.setName("player").setDescription("Player to look up (blank = yourself)").setRequired(false)),
   new SlashCommandBuilder().setName("leaderboard").setDescription("Show the top players by wins"),
+  new SlashCommandBuilder().setName("purge").setDescription("Clear all messages in this channel").setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+  new SlashCommandBuilder().setName("exportstats").setDescription("DM you the raw stats file (admin only)").setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
+  new SlashCommandBuilder().setName("forceclose").setDescription("Force close and delete this lobby (admin only)").setDefaultMemberPermissions(PermissionsBitField.Flags.ManageGuild),
   new SlashCommandBuilder()
     .setName("link").setDescription("Link your Riot ID to your Discord account")
     .addStringOption(o=>o.setName("riotid").setDescription("Your Riot ID (e.g. Name#TAG)").setRequired(true)),
@@ -215,6 +218,36 @@ async function lockChannel(channel, guild) {
   await channel.permissionOverwrites.edit(guild.members.me, { SendMessages:true, AddReactions:true }).catch(()=>{});
 }
 
+// ─── Purge Channel ───────────────────────────────────────────────────────────
+
+async function purgeChannel(channel) {
+  try {
+    let deleted = 1;
+    while (deleted > 0) {
+      const fetched = await channel.messages.fetch({ limit: 100 });
+      if (fetched.size === 0) break;
+      // bulkDelete only works for messages under 14 days old
+      const recent = fetched.filter(m => Date.now() - m.createdTimestamp < 14 * 24 * 60 * 60 * 1000);
+      if (recent.size > 1) {
+        const result = await channel.bulkDelete(recent, true).catch(()=>null);
+        deleted = result ? result.size : 0;
+      } else if (recent.size === 1) {
+        await recent.first().delete().catch(()=>{});
+        deleted = 1;
+      } else {
+        // All messages are older than 14 days, delete one by one
+        for (const msg of fetched.values()) {
+          await msg.delete().catch(()=>{});
+        }
+        break;
+      }
+      await new Promise(r => setTimeout(r, 500)); // small delay to avoid rate limits
+    }
+  } catch(e) {
+    console.error('[Purge] Failed:', e);
+  }
+}
+
 // ─── Post Queue Alert ─────────────────────────────────────────────────────────
 
 async function postQueueAlert(guild, channelId) {
@@ -226,7 +259,7 @@ async function postQueueAlert(guild, channelId) {
   const embed = new EmbedBuilder()
     .setColor(0xff4655).setTitle("🎯  VPS SCRIMS — 10-MAN QUEUE")
     .setDescription(`A new 10-man custom lobby is starting!\n\nPress **Join Queue** to enter.\nUse \`/party @user\` to invite a friend — they must accept before you both join.\n\n**Rank Range:** ${rangeText}\n\n**Players (0/${QUEUE_SIZE}):**\n*No one yet...*`)
-    .setFooter({ text:"Queue closes when 10 players join • Teams are balanced by rank" }).setTimestamp();
+    .setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("join_queue").setLabel("Join Queue").setStyle(ButtonStyle.Danger).setEmoji("⚔️"),
@@ -234,6 +267,12 @@ async function postQueueAlert(guild, channelId) {
   );
 
   const msg = await channel.send({ embeds:[embed], components:[row] });
+
+  // Edit the embed to add the queue ID in the footer now that we have the message ID
+  const embedWithId = new EmbedBuilder(embed.toJSON())
+    .setFooter({ text:`Queue ID: ${msg.id} • Queue closes when 10 players join • Teams balanced by rank` });
+  await msg.edit({ embeds:[embedWithId], components:[row] }).catch(()=>{});
+
   const queue = {
     id:msg.id, guildId:guild.id, messageId:msg.id, channelId,
     players:new Set(), playerRanks:new Map(), parties:new Map(), partyOf:new Map(),
@@ -710,9 +749,11 @@ client.on("interactionCreate", async (interaction) => {
 
   if (commandName === "setup") {
     gs.channelId = interaction.channelId;
+    await interaction.deferReply({ ephemeral:true });
     await lockChannel(interaction.channel, interaction.guild);
+    await purgeChannel(interaction.channel);
     startAutoQueue(interaction.guild, interaction.channelId);
-    await interaction.reply({ content:`✅ Queue channel set. Auto-queue active every 40 min.\nRank range: **${gs.rankRange.min} → ${gs.rankRange.max}**`, ephemeral:true });
+    await interaction.editReply({ content:`✅ Queue channel set. Channel purged and locked. Auto-queue active every 40 min.\nRank range: **${gs.rankRange.min} → ${gs.rankRange.max}**` });
   }
 
   else if (commandName === "setupresults") {
@@ -722,7 +763,9 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   else if (commandName === "setuproles") {
+    await interaction.deferReply({ ephemeral:true });
     await lockChannel(interaction.channel, interaction.guild);
+    await purgeChannel(interaction.channel);
     const embed = new EmbedBuilder()
       .setColor(0xff4655).setTitle("🏅  Select Your Rank")
       .setDescription("Pick your **current Valorant rank** from the dropdown.\nSelecting a new rank removes your old one automatically.\n\n> ⚠️ **Please select your honest rank.** Misrepresenting your rank may result in a ban from this server.")
@@ -730,7 +773,7 @@ client.on("interactionCreate", async (interaction) => {
     const menu = new StringSelectMenuBuilder().setCustomId("select_rank").setPlaceholder("Choose your rank...")
       .addOptions(RANK_ORDER.map(rank=>new StringSelectMenuOptionBuilder().setLabel(rank).setValue(rank).setEmoji(RANK_EMOJIS[rank])));
     await interaction.channel.send({ embeds:[embed], components:[new ActionRowBuilder().addComponents(menu)] });
-    await interaction.reply({ content:"✅ Rank selection embed posted and channel locked.", ephemeral:true });
+    await interaction.editReply({ content:"✅ Rank selection embed posted, channel purged and locked." });
   }
 
   else if (commandName === "setrange") {
@@ -756,8 +799,16 @@ client.on("interactionCreate", async (interaction) => {
     const id = interaction.options.getString("id");
     let queue = id ? activeQueues.get(id) : [...activeQueues.values()].filter(q=>q.guildId===guildId).pop();
     if (!queue) return interaction.reply({ content:"❌ No matching queue found.", ephemeral:true });
+    // Delete the queue message
+    try {
+      const qChannel = await interaction.guild.channels.fetch(queue.channelId).catch(()=>null);
+      if (qChannel) {
+        const qMsg = await qChannel.messages.fetch(queue.messageId).catch(()=>null);
+        if (qMsg) await qMsg.delete().catch(()=>{});
+      }
+    } catch(e) {}
     await cleanupLobby(interaction.guild, queue);
-    await interaction.reply({ content:"✅ Queue cancelled.", ephemeral:true });
+    await interaction.reply({ content:"✅ Queue cancelled and message deleted.", ephemeral:true });
   }
 
   else if (commandName === "status") {
@@ -912,6 +963,35 @@ client.on("interactionCreate", async (interaction) => {
     } else {
       await interaction.reply({ embeds:[embed] });
     }
+  }
+
+  else if (commandName === "exportstats") {
+    if (!fs.existsSync(STATS_FILE)) {
+      return interaction.reply({ content:"❌ No stats file found yet — no games have been completed.", ephemeral:true });
+    }
+    try {
+      const { AttachmentBuilder } = require("discord.js");
+      const attachment = new AttachmentBuilder(STATS_FILE, { name:"stats.json" });
+      await interaction.user.send({ content:"📊 Here's your current VPS Scrims stats file:", files:[attachment] });
+      await interaction.reply({ content:"✅ Stats file sent to your DMs.", ephemeral:true });
+    } catch(e) {
+      await interaction.reply({ content:"❌ Couldn't DM you — make sure your DMs are open.", ephemeral:true });
+    }
+  }
+
+  else if (commandName === "purge") {
+    await interaction.deferReply({ ephemeral:true });
+    await purgeChannel(interaction.channel);
+    await interaction.editReply({ content:"✅ Channel purged." });
+  }
+
+  else if (commandName === "forceclose") {
+    const queueId = lobbyChannelToQueue.get(interaction.channelId);
+    if (!queueId) return interaction.reply({ content:"❌ Use this command inside a `#lobby-info` channel.", ephemeral:true });
+    const queue = activeQueues.get(queueId);
+    if (!queue) return interaction.reply({ content:"❌ This lobby no longer exists.", ephemeral:true });
+    await interaction.reply({ content:"🗑️ Force closing lobby...", ephemeral:true });
+    await cleanupLobby(interaction.guild, queue);
   }
 
   else if (commandName === "link") {
