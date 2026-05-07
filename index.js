@@ -49,7 +49,8 @@ const STATS_FILE = path.join(__dirname, "stats.json");
 // stats shape: { [guildId]: { [userId]: { wins, losses, ties, games, kills, deaths, assists, kdaGames } } }
 let allStats = {};
 
-// riotIds shape: { [guildId]: { [userId]: 'RiotName#TAG' } }
+// riotIds shape: { [guildId]: { [userId]: { riotId: 'Name#TAG', puuid: 'uuid' } } }
+// Still stores riotId for display, but puuid is used for matching
 let riotIds = {};
 
 function loadStats() {
@@ -75,14 +76,33 @@ function saveStats() {
   }
 }
 
-function getRiotId(guildId, userId) {
+function getRiotData(guildId, userId) {
   return riotIds[guildId]?.[userId] || null;
 }
 
-function setRiotId(guildId, userId, riotId) {
+// Backward compat — returns display string for embeds
+function getRiotId(guildId, userId) {
+  const d = getRiotData(guildId, userId);
+  if (!d) return null;
+  return typeof d === "string" ? d : d.riotId;
+}
+
+function setRiotData(guildId, userId, riotId, puuid) {
   if (!riotIds[guildId]) riotIds[guildId] = {};
-  riotIds[guildId][userId] = riotId;
+  riotIds[guildId][userId] = { riotId, puuid };
   saveStats();
+}
+
+// Build puuid -> discordId map for a set of player IDs
+function buildPuuidMap(guildId, playerIds) {
+  const map = {};
+  for (const uid of playerIds) {
+    const d = getRiotData(guildId, uid);
+    if (!d) continue;
+    const puuid = typeof d === "string" ? null : d.puuid;
+    if (puuid) map[puuid] = uid;
+  }
+  return map;
 }
 
 function getPlayerStats(guildId, userId) {
@@ -667,7 +687,8 @@ async function processHenrikMatch(matchResult, queue, guild) {
 
   const allPlayers = [...(queue.teams?.team1||[]), ...(queue.teams?.team2||[])];
 
-  // Build a map of riotId (lowercase) -> discordUserId
+  // Build lookup maps — PUUID first (name-change proof), fall back to name matching
+  const puuidToDiscord = buildPuuidMap(guild.id, allPlayers);
   const riotToDiscord = {};
   for (const uid of allPlayers) {
     const riot = getRiotId(guild.id, uid);
@@ -684,22 +705,31 @@ async function processHenrikMatch(matchResult, queue, guild) {
     : (matchData.players?.all_players || []);
 
   const roundsPlayed = version === "v4"
-    ? (matchData.metadata?.game_length_in_ms ? 1 : matchData.rounds?.length || 1)
+    ? (matchData.rounds?.length || 1)
     : (matchData.metadata?.rounds_played || 1);
 
   for (const p of playerList) {
     const name = p.name || "";
     const tag = p.tag || "";
-    const exactKey = (name + "#" + tag).toLowerCase().trim();
-    const nameOnlyKey = name.toLowerCase().trim();
+    const puuid = p.puuid || "";
 
-    let discordId = riotToDiscord[exactKey];
+    // 1. Match by PUUID — always correct, survives name changes
+    let discordId = puuid ? puuidToDiscord[puuid] : null;
+
+    // 2. Fallback: exact name#tag match (lowercased)
     if (!discordId) {
-      // fallback: match on name only — handles tag case differences
+      const exactKey = (name + "#" + tag).toLowerCase().trim();
+      discordId = riotToDiscord[exactKey];
+    }
+
+    // 3. Last resort: name-only match
+    if (!discordId) {
+      const nameOnlyKey = name.toLowerCase().trim();
       for (const [storedKey, uid] of Object.entries(riotToDiscord)) {
         if (storedKey.split("#")[0] === nameOnlyKey) { discordId = uid; break; }
       }
     }
+
     if (!discordId) {
       console.log(`[Henrik] No match for player: ${name}#${tag}`);
       continue;
@@ -1071,8 +1101,43 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content:"❌ Invalid Riot ID — name max 16 chars, tag max 5.", ephemeral:true });
     }
     const normalizedRiotId = parts[0].trim() + "#" + parts[1].trim();
-    setRiotId(guildId, interaction.user.id, normalizedRiotId);
-    await interaction.reply({ content:`✅ Linked **${normalizedRiotId}** to your Discord.\n\nThis will show on team embeds, results, and your stats.`, ephemeral:true });
+
+    await interaction.deferReply({ ephemeral: true });
+
+    // Look up PUUID via Henrik account endpoint
+    let puuid = null;
+    let resolvedName = normalizedRiotId;
+    try {
+      const name = encodeURIComponent(parts[0].trim());
+      const tag = encodeURIComponent(parts[1].trim());
+      const res = await fetch(`${HENRIK_BASE}/v2/account/${name}/${tag}`, {
+        headers: { "Authorization": process.env.HENRIK_API_KEY },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === 200 && data.data?.puuid) {
+          puuid = data.data.puuid;
+          // Use the name Henrik returns — it's the current verified name
+          resolvedName = data.data.name + "#" + data.data.tag;
+          console.log(`[Link] Resolved ${normalizedRiotId} -> PUUID ${puuid} (current name: ${resolvedName})`);
+        }
+      }
+    } catch(e) {
+      console.error("[Link] PUUID lookup failed:", e);
+    }
+
+    if (!puuid) {
+      await interaction.editReply({
+        content: `⚠️ Could not verify **${normalizedRiotId}** with the Riot API — the account may not exist or Henrik API is down.\n\nLinked anyway, but matching may be less reliable until the account is verified.`,
+      });
+      setRiotData(guildId, interaction.user.id, normalizedRiotId, null);
+      return;
+    }
+
+    setRiotData(guildId, interaction.user.id, resolvedName, puuid);
+    await interaction.editReply({
+      content: `✅ Linked **${resolvedName}** to your Discord.\n\nYour account is verified — matching will work even if you change your name in future.`,
+    });
   }
 
   else if (commandName === "unlink") {
@@ -1080,7 +1145,7 @@ client.on("interactionCreate", async (interaction) => {
     if (!existing) return interaction.reply({ content:"You don't have a Riot ID linked.", ephemeral:true });
     if (riotIds[guildId]) delete riotIds[guildId][interaction.user.id];
     saveStats();
-    await interaction.reply({ content:"✅ Riot ID unlinked.", ephemeral:true });
+    await interaction.reply({ content:`✅ Unlinked **${existing}**.`, ephemeral:true });
   }
 
   else if (commandName === "party") {
