@@ -392,12 +392,26 @@ async function postTeams(guild, queue) {
   });
   queue.categoryId = category.id;
 
-  // Create voice channels
+  // Create voice channels with team-locked permissions
   const vc1 = await guild.channels.create({
     name: "🔴 Team 1",
     type: ChannelType.GuildVoice,
     parent: category.id,
     userLimit: TEAM_SIZE,
+    permissionOverwrites: [
+      { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel] },
+      // Team 1 players — allowed in VC1
+      ...team1.map((id) => ({
+        id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect],
+      })),
+      // Team 2 players — can see but cannot connect to VC1
+      ...team2.map((id) => ({
+        id,
+        allow: [PermissionsBitField.Flags.ViewChannel],
+        deny: [PermissionsBitField.Flags.Connect],
+      })),
+    ],
   });
 
   const vc2 = await guild.channels.create({
@@ -405,6 +419,20 @@ async function postTeams(guild, queue) {
     type: ChannelType.GuildVoice,
     parent: category.id,
     userLimit: TEAM_SIZE,
+    permissionOverwrites: [
+      { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel] },
+      // Team 2 players — allowed in VC2
+      ...team2.map((id) => ({
+        id,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect],
+      })),
+      // Team 1 players — can see but cannot connect to VC2
+      ...team1.map((id) => ({
+        id,
+        allow: [PermissionsBitField.Flags.ViewChannel],
+        deny: [PermissionsBitField.Flags.Connect],
+      })),
+    ],
   });
 
   // Create private lobby text channel
@@ -425,18 +453,17 @@ async function postTeams(guild, queue) {
     .addFields(
       {
         name: `🔴  Team 1 — avg. ${avgRankLabel(team1)}`,
-        value: t1Lines.join("\n"),
+        value: t1Lines.join("\n") + `\n\n[🔊 Join Team 1 VC](https://discord.com/channels/${guild.id}/${vc1.id})`,
         inline: true,
       },
       {
         name: `🔵  Team 2 — avg. ${avgRankLabel(team2)}`,
-        value: t2Lines.join("\n"),
+        value: t2Lines.join("\n") + `\n\n[🔊 Join Team 2 VC](https://discord.com/channels/${guild.id}/${vc2.id})`,
         inline: true,
       },
       {
         name: "\u200B",
         value:
-          `Voice channels: ${vc1} and ${vc2}\n\n` +
           `Head to ${lobbyChannel} for lobby info.\n\n` +
           "Someone run `/lobby` to claim host, then `/lobby [code]` to share the code.\n" +
           "Type **`ready`** in this channel once you're in the lobby.",
@@ -672,11 +699,33 @@ client.on("interactionCreate", async (interaction) => {
 
         q.lobbyLeaderId = interaction.user.id;
 
+        // Grant lobby leader access to both VCs
+        const vc1 = q.voiceChannels.team1Id
+          ? await interaction.guild.channels.fetch(q.voiceChannels.team1Id).catch(() => null)
+          : null;
+        const vc2 = q.voiceChannels.team2Id
+          ? await interaction.guild.channels.fetch(q.voiceChannels.team2Id).catch(() => null)
+          : null;
+
+        if (vc1) {
+          await vc1.permissionOverwrites.edit(interaction.user.id, {
+            ViewChannel: true,
+            Connect: true,
+          }).catch(() => {});
+        }
+        if (vc2) {
+          await vc2.permissionOverwrites.edit(interaction.user.id, {
+            ViewChannel: true,
+            Connect: true,
+          }).catch(() => {});
+        }
+
         const embed = new EmbedBuilder()
           .setColor(0xff4655)
           .setTitle("👑  Lobby Leader Assigned")
           .setDescription(
             `**${displayName}** is the lobby leader for this 10-man.\n\n` +
+            "As lobby leader you can join **both** voice channels.\n\n" +
             "Set up the custom game in Valorant:\n" +
             "**Game Mode:** Standard • **Map:** Your choice\n\n" +
             "Once you have the lobby code run `/lobby [code]` to share it here."
