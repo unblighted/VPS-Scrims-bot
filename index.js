@@ -625,27 +625,45 @@ async function parseScreenshot(imageUrl, queue, guild) {
 // ─── Henrik API ──────────────────────────────────────────────────────────────
 
 async function fetchMatchFromHenrik(matchId) {
+  // Try v4 for each common region, then fall back to v2
+  const regions = ["eu", "na", "ap", "kr"];
+  for (const region of regions) {
+    try {
+      const res = await fetch(`${HENRIK_BASE}/v4/match/${region}/pc/${matchId}`, {
+        headers: { "Authorization": process.env.HENRIK_API_KEY },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === 200 && data.data) {
+          console.log(`[Henrik] v4 match found in region: ${region}`);
+          return { version: "v4", data: data.data };
+        }
+      }
+    } catch(e) {}
+  }
+  // Fall back to v2
   try {
     const res = await fetch(`${HENRIK_BASE}/v2/match/${matchId}`, {
       headers: { "Authorization": process.env.HENRIK_API_KEY },
     });
-    if (!res.ok) {
-      console.error(`[Henrik] API returned ${res.status} for match ${matchId}`);
-      return null;
+    if (res.ok) {
+      const data = await res.json();
+      if ((data.status === 200 || data.status === "ok") && data.data) {
+        console.log("[Henrik] v2 match found");
+        return { version: "v2", data: data.data };
+      }
     }
-    const data = await res.json();
-    if (data.status !== 200 && data.status !== "ok") return null;
-    return data.data || null;
-  } catch(e) {
-    console.error("[Henrik] Fetch failed:", e);
-    return null;
-  }
+  } catch(e) {}
+  console.error(`[Henrik] Could not fetch match ${matchId} from any region/version`);
+  return null;
 }
 
 // Parse Henrik match data and cross-reference with lobby players
 // Returns { winnerTeam, kdaMap, mapName, score, matchId } or null
-async function processHenrikMatch(matchData, queue, guild) {
-  if (!matchData || !matchData.players || !matchData.teams) return null;
+async function processHenrikMatch(matchResult, queue, guild) {
+  if (!matchResult) return null;
+  const { version, data: matchData } = matchResult;
+  if (!matchData) return null;
 
   const allPlayers = [...(queue.teams?.team1||[]), ...(queue.teams?.team2||[])];
 
@@ -653,60 +671,109 @@ async function processHenrikMatch(matchData, queue, guild) {
   const riotToDiscord = {};
   for (const uid of allPlayers) {
     const riot = getRiotId(guild.id, uid);
-    if (riot) riotToDiscord[riot.toLowerCase()] = uid;
+    if (riot) riotToDiscord[riot.toLowerCase().trim()] = uid;
   }
 
-  if (Object.keys(riotToDiscord).length < 2) return null; // not enough linked IDs
-
-  // Map Henrik players to discord IDs
   const kdaMap = {};
-  const teamAssignment = {}; // discordId -> "Red" | "Blue"
+  const teamAssignment = {};
 
-  for (const p of matchData.players.all_players || []) {
-    const riotKey = `${p.name}#${p.tag}`.toLowerCase();
-    const discordId = riotToDiscord[riotKey];
-    if (!discordId) continue;
+  // Normalize player list — v4 uses flat array with agent.name and team_id
+  // v2 uses players.all_players with character and team
+  const playerList = version === "v4"
+    ? (matchData.players || [])
+    : (matchData.players?.all_players || []);
+
+  const roundsPlayed = version === "v4"
+    ? (matchData.metadata?.game_length_in_ms ? 1 : matchData.rounds?.length || 1)
+    : (matchData.metadata?.rounds_played || 1);
+
+  for (const p of playerList) {
+    const name = p.name || "";
+    const tag = p.tag || "";
+    const exactKey = (name + "#" + tag).toLowerCase().trim();
+    const nameOnlyKey = name.toLowerCase().trim();
+
+    let discordId = riotToDiscord[exactKey];
+    if (!discordId) {
+      // fallback: match on name only — handles tag case differences
+      for (const [storedKey, uid] of Object.entries(riotToDiscord)) {
+        if (storedKey.split("#")[0] === nameOnlyKey) { discordId = uid; break; }
+      }
+    }
+    if (!discordId) {
+      console.log(`[Henrik] No match for player: ${name}#${tag}`);
+      continue;
+    }
+
+    // v4: agent is { name: "Sova" }, team is team_id
+    // v2: agent is character string, team is team
+    const agentName = version === "v4"
+      ? (p.agent?.name || "")
+      : (p.character || "");
+    const teamId = version === "v4"
+      ? (p.team_id || "")
+      : (p.team || "");
+    const score = p.stats?.score || 0;
+    const acs = Math.round(score / Math.max(roundsPlayed, 1));
+
     kdaMap[discordId] = {
       k: p.stats?.kills || 0,
       d: p.stats?.deaths || 0,
       a: p.stats?.assists || 0,
-      acs: p.stats?.score ? Math.round(p.stats.score / (matchData.metadata?.rounds_played || 1)) : 0,
-      agent: p.character || "",
-      team: p.team || "",
+      acs,
+      agent: agentName,
+      team: teamId,
     };
-    teamAssignment[discordId] = p.team; // "Red" or "Blue"
+    teamAssignment[discordId] = teamId;
+    console.log(`[Henrik] Matched ${name}#${tag} -> Discord ID ${discordId} (team: ${teamId})`);
   }
 
-  // Figure out which Henrik team (Red/Blue) maps to our team1/team2
-  // by seeing which lobby team has more players on which Henrik team
+  // Map our lobby teams to Henrik Red/Blue
   let team1Red = 0, team1Blue = 0;
   for (const uid of queue.teams.team1) {
-    if (teamAssignment[uid] === "Red") team1Red++;
-    else if (teamAssignment[uid] === "Blue") team1Blue++;
+    const t = teamAssignment[uid] || "";
+    if (t === "Red") team1Red++;
+    else if (t === "Blue") team1Blue++;
   }
   const team1HenrikTeam = team1Red >= team1Blue ? "Red" : "Blue";
   const team2HenrikTeam = team1HenrikTeam === "Red" ? "Blue" : "Red";
 
-  // Get match result
-  const winningTeam = matchData.teams?.red?.has_won
-    ? "Red"
-    : matchData.teams?.blue?.has_won
-    ? "Blue"
-    : null;
+  // Get winning team — v4 and v2 both use teams.red.has_won / teams.blue.has_won
+  const teamsData = matchData.teams;
+  const redWon = version === "v4"
+    ? teamsData?.find(t => t.team_id === "Red")?.won
+    : teamsData?.red?.has_won;
+  const blueWon = version === "v4"
+    ? teamsData?.find(t => t.team_id === "Blue")?.won
+    : teamsData?.blue?.has_won;
 
+  const winningHenrikTeam = redWon ? "Red" : blueWon ? "Blue" : null;
   let winnerTeam = "tie";
-  if (winningTeam === team1HenrikTeam) winnerTeam = "team1";
-  else if (winningTeam === team2HenrikTeam) winnerTeam = "team2";
+  if (winningHenrikTeam === team1HenrikTeam) winnerTeam = "team1";
+  else if (winningHenrikTeam === team2HenrikTeam) winnerTeam = "team2";
 
-  const redScore = matchData.teams?.red?.rounds_won ?? "?";
-  const blueScore = matchData.teams?.blue?.rounds_won ?? "?";
-  const team1Score = team1HenrikTeam === "Red" ? redScore : blueScore;
-  const team2Score = team1HenrikTeam === "Red" ? blueScore : redScore;
+  // Get round scores
+  const redRounds = version === "v4"
+    ? (teamsData?.find(t => t.team_id === "Red")?.rounds?.won ?? "?")
+    : (teamsData?.red?.rounds_won ?? "?");
+  const blueRounds = version === "v4"
+    ? (teamsData?.find(t => t.team_id === "Blue")?.rounds?.won ?? "?")
+    : (teamsData?.blue?.rounds_won ?? "?");
+
+  const team1Score = team1HenrikTeam === "Red" ? redRounds : blueRounds;
+  const team2Score = team1HenrikTeam === "Red" ? blueRounds : redRounds;
+
+  // Map name
+  const mapName = version === "v4"
+    ? (matchData.metadata?.map?.name || "Unknown Map")
+    : (matchData.metadata?.map || "Unknown Map");
+
+  console.log(`[Henrik] Result: ${winnerTeam} | Map: ${mapName} | Score: ${team1Score}-${team2Score} | Matched: ${Object.keys(kdaMap).length}/${allPlayers.length}`);
 
   return {
     winnerTeam,
     kdaMap,
-    mapName: matchData.metadata?.map || "Unknown Map",
+    mapName,
     score: `${team1Score} - ${team2Score}`,
     matchedPlayers: Object.keys(kdaMap).length,
     totalPlayers: allPlayers.length,
@@ -1003,8 +1070,9 @@ client.on("interactionCreate", async (interaction) => {
     if (parts[0].length > 16 || parts[1].length > 5) {
       return interaction.reply({ content:"❌ Invalid Riot ID — name max 16 chars, tag max 5.", ephemeral:true });
     }
-    setRiotId(guildId, interaction.user.id, riotId);
-    await interaction.reply({ content:`✅ Linked **${riotId}** to your Discord.\n\nThis will show on team embeds, results, and your stats.`, ephemeral:true });
+    const normalizedRiotId = parts[0].trim() + "#" + parts[1].trim();
+    setRiotId(guildId, interaction.user.id, normalizedRiotId);
+    await interaction.reply({ content:`✅ Linked **${normalizedRiotId}** to your Discord.\n\nThis will show on team embeds, results, and your stats.`, ephemeral:true });
   }
 
   else if (commandName === "unlink") {
