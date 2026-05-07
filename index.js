@@ -37,7 +37,7 @@ const DEFAULT_RANGE = { min: "Iron", max: "Radiant" };
 
 // ─── Queue Size ───────────────────────────────────────────────────────────────
 // Change to 2 or 3 for testing, set back to 10 for production
-const QUEUE_SIZE = 10;
+const QUEUE_SIZE = 2;
 const TEAM_SIZE = Math.floor(QUEUE_SIZE / 2);
 
 // ─── State ────────────────────────────────────────────────────────────────────
