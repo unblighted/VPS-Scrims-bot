@@ -629,7 +629,7 @@ async function fetchMatchFromHenrik(matchId) {
   const regions = ["eu", "na", "ap", "kr"];
   for (const region of regions) {
     try {
-      const res = await fetch(`${HENRIK_BASE}/v4/match/${region}/pc/${matchId}`, {
+      const res = await fetch(`${HENRIK_BASE}/v4/match/${region}/${matchId}`, {
         headers: { "Authorization": process.env.HENRIK_API_KEY },
       });
       if (res.ok) {
