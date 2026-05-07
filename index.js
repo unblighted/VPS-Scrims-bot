@@ -33,6 +33,11 @@ const RANK_ORDER = [
 
 const DEFAULT_RANGE = { min: "Iron", max: "Radiant" };
 
+// ─── Queue Size ───────────────────────────────────────────────────────────────
+// Change to 2 or 3 for testing, set back to 10 for production
+const QUEUE_SIZE = 10;
+const TEAM_SIZE = Math.floor(QUEUE_SIZE / 2);
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = { guilds: {} };
@@ -285,7 +290,7 @@ async function updateQueueEmbed(guild, queue) {
       .setLabel("Join Queue")
       .setStyle(ButtonStyle.Danger)
       .setEmoji("⚔️")
-      .setDisabled(playerCount >= 10),
+      .setDisabled(playerCount >= QUEUE_SIZE),
     new ButtonBuilder()
       .setCustomId("leave_queue")
       .setLabel("Leave Queue")
@@ -336,7 +341,7 @@ function splitTeamsByRank(players, playerRanks, parties, partyOf) {
     }
   }
 
-  return { team1: team1.slice(0, 5), team2: team2.slice(0, 5) };
+  return { team1: team1.slice(0, TEAM_SIZE), team2: team2.slice(0, TEAM_SIZE) };
 }
 
 // ─── Post Teams ───────────────────────────────────────────────────────────────
@@ -392,14 +397,14 @@ async function postTeams(guild, queue) {
     name: "🔴 Team 1",
     type: ChannelType.GuildVoice,
     parent: category.id,
-    userLimit: 5,
+    userLimit: TEAM_SIZE,
   });
 
   const vc2 = await guild.channels.create({
     name: "🔵 Team 2",
     type: ChannelType.GuildVoice,
     parent: category.id,
-    userLimit: 5,
+    userLimit: TEAM_SIZE,
   });
 
   // Create private lobby text channel
@@ -886,7 +891,7 @@ client.on("interactionCreate", async (interaction) => {
       if (!q || q.phase !== "queue") {
         return interaction.reply({ content: "❌ No active queue.", ephemeral: true });
       }
-      if (q.players.size >= 10) {
+      if (q.players.size >= QUEUE_SIZE) {
         return interaction.reply({ content: "❌ Queue is full.", ephemeral: true });
       }
       if (q.players.has(interaction.user.id)) {
@@ -931,7 +936,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferUpdate();
       await updateQueueEmbed(interaction.guild, q);
 
-      if (q.players.size >= 10) {
+      if (q.players.size >= QUEUE_SIZE) {
         q.phase = "teams";
         q.teams = splitTeamsByRank(q.players, q.playerRanks, q.parties || new Map(), q.partyOf || new Map());
         await postTeams(interaction.guild, q);
